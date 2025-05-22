@@ -138,6 +138,18 @@ mod testnet_faucet {
         use super::*;
         use ink::env::{test, DefaultEnvironment};
 
+        // Helper function to advance block timestamp by specified milliseconds
+        fn advance_timestamp(duration_ms: u64) {
+            let mut current_block = test::recorded_events().count() as u32 + 1;
+            let mut block_timestamp = test::block_timestamp::<DefaultEnvironment>();
+            
+            // Advance block and timestamp
+            block_timestamp += duration_ms;
+            test::set_block_timestamp::<DefaultEnvironment>(block_timestamp);
+            current_block += 1;
+            test::set_block_number::<DefaultEnvironment>(current_block);
+        }
+
         #[ink::test]
         fn default_works() {
             let faucet = TestnetFaucet::default();
@@ -167,7 +179,7 @@ mod testnet_faucet {
             assert_eq!(faucet.request_funds(recipient), Err(Error::CooldownNotExpired));
             
             // Advance time
-            test::advance_time::<DefaultEnvironment>(1001);
+            advance_timestamp(1001);
             
             // Now the request should succeed
             assert!(faucet.request_funds(recipient).is_ok());
@@ -196,14 +208,14 @@ mod testnet_faucet {
             assert!(faucet.time_until_next_request(accounts.bob).unwrap().is_some());
             
             // Advance time partially
-            test::advance_time::<DefaultEnvironment>(500);
+            advance_timestamp(500);
             
             // Should still return Some time, but less
             let time_left = faucet.time_until_next_request(accounts.bob).unwrap().unwrap();
             assert!(time_left > 0 && time_left <= 500);
             
             // Advance time fully
-            test::advance_time::<DefaultEnvironment>(1000);
+            advance_timestamp(1000);
             
             // Should return None again
             assert_eq!(faucet.time_until_next_request(accounts.bob).unwrap(), None);
