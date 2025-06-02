@@ -1,25 +1,47 @@
 #![cfg_attr(not(feature = "std"), no_std, no_main)]
 
-#[ink::contract]
-mod testnet_faucet {
+#[ink::contract(env = liberland_extension::LiberlandEnvironment)]
+mod faucet {
     use ink::storage::Mapping;
 
-    /// Error type for the faucet contract
+    /// Custom errors for the faucet contract
     #[derive(Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub enum Error {
-        /// Transfer failed
-        TransferFailed,
-        /// Not enough time has passed since last funding
-        CooldownNotExpired,
-        /// Not authorized to call this function
-        NotAuthorized,
-        /// Arithmetic operation failed
-        ArithmeticError,
-        /// Token contract call failed
-        TokenContractError,
+        /// Account has already been funded within the 24-hour period
+        TooEarlyForFunding,
+        /// Only the owner can call this function
+        OnlyOwner,
+        /// Invalid amount
+        InvalidAmount,
     }
 
+    /// Events emitted by the faucet contract
+    #[ink(event)]
+    pub struct LLDFundingRecorded {
+        #[ink(topic)]
+        receiver: AccountId,
+        amount: Balance,
+        timestamp: Timestamp,
+    }
+
+    #[ink(event)]
+    pub struct LLMFundingRecorded {
+        #[ink(topic)]
+        receiver: AccountId,
+        amount: Balance,
+        timestamp: Timestamp,
+    }
+
+    #[ink(event)]
+    pub struct OwnerChanged {
+        #[ink(topic)]
+        old_owner: AccountId,
+        #[ink(topic)]
+        new_owner: AccountId,
+    }
+
+    /// Token type for funding
     #[derive(Debug, PartialEq, Eq, scale::Encode, scale::Decode)]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub enum TokenType {
@@ -27,396 +49,346 @@ mod testnet_faucet {
         LLM,
     }
 
-    /// Minimal PSP22 token interface for cross-contract calls
-    #[ink::trait_definition]
-    pub trait PSP22 {
-        #[ink(message)]
-        fn transfer(&mut self, to: AccountId, value: Balance) -> Result<(), ()>;
-        
-        #[ink(message)]
-        fn balance_of(&self, owner: AccountId) -> Balance;
-    }
-
-    #[ink(event)]
-    pub struct RequestFundsEvent {
-        #[ink(topic)]
-        recipient: AccountId,
-        #[ink(topic)]
-        amount: Balance,
-        #[ink(topic)]
-        token_type: TokenType,
-    }
-
-    /// Testnet faucet that distributes LLD and LLM tokens
+    /// The faucet registry contract storage
     #[ink(storage)]
-    pub struct TestnetFaucet {
-        /// Tracks last request timestamp for each account for LLD
-        lld_fundings: Mapping<AccountId, u64>,
-        /// Amount to fund each request (in LLD units)
-        lld_funding_amount: Balance,
-        /// Cooldown period in milliseconds (default: 1 day)
-        lld_cooldown_period: u64,
-        /// Tracks last request timestamp for each account for LLM
-        llm_fundings: Mapping<AccountId, u64>,
-        /// Amount to fund each request (in LLM units)
-        llm_funding_amount: Balance,
-        /// Cooldown period in milliseconds (default: 1 day)
-        llm_cooldown_period: u64,
-        /// LLM token contract address
-        llm_token_contract: Option<AccountId>,
-        /// Contract owner
+    pub struct Faucet {
+        /// Owner of the faucet contract (backend EOA)
         owner: AccountId,
+        /// Mapping from receiver address to last LLD funding timestamp
+        lld_fundings: Mapping<AccountId, Timestamp>,
+        /// Mapping from receiver address to last LLM funding timestamp
+        llm_fundings: Mapping<AccountId, Timestamp>,
+        /// Amount of LLD to fund per request (in smallest unit)
+        lld_amount: Balance,
+        /// Amount of LLM to fund per request (in smallest unit)
+        llm_amount: Balance,
+        /// Time period that must pass between fundings (24 hours in milliseconds)
+        funding_period: u64,
     }
 
-    impl TestnetFaucet {
-        /// Creates a new testnet faucet
+    impl Faucet {
+        /// Constructor for the faucet registry contract
         #[ink(constructor)]
-        pub fn new(
-            lld_funding_amount: Balance,
-            lld_cooldown_period: u64,
-            llm_funding_amount: Balance,
-            llm_cooldown_period: u64,
-            llm_token_contract: Option<AccountId>,
-        ) -> Self {
+        pub fn new() -> Self {
+            let caller = Self::env().caller();
             Self {
+                owner: caller,
                 lld_fundings: Mapping::default(),
-                lld_funding_amount,
-                lld_cooldown_period,
                 llm_fundings: Mapping::default(),
-                llm_funding_amount,
-                llm_cooldown_period,
-                llm_token_contract,
-                owner: Self::env().caller(),
+                lld_amount: 1_000_000_000_000_000, // 1000 LLD (12 decimals)
+                llm_amount: 10_000_000_000_000,    // 10 LLM (12 decimals)
+                funding_period: 24 * 60 * 60 * 1000, // 24 hours in milliseconds
             }
         }
 
-        /// Creates a new testnet faucet with default values
-        /// Funding amount: 1000 LLD/LLM
-        /// Cooldown period: 1 day (86,400,000 milliseconds)
-        /// LLM token contract: None (must be set later)
-        #[ink(constructor)]
-        pub fn default() -> Self {
-            Self::new(
-                1000 * 1_000_000_000_000,
-                86_400_000,
-                1000 * 1_000_000_000_000,
-                86_400_000,
-                None,
-            )
-        }
-
-        /// Set the LLM token contract address (only owner)
+        /// Record LLD funding for an account (called by backend after sending tokens)
+        /// Can only be called by the owner
         #[ink(message)]
-        pub fn set_llm_token_contract(&mut self, contract_address: AccountId) {
-            assert!(self.env().caller() == self.owner, "Only owner can set token contract");
-            self.llm_token_contract = Some(contract_address);
-        }
-
-        /// Request funds for a specific wallet
-        /// Only contract owner can call this function
-        /// Returns Ok if successful, Error otherwise
-        #[ink(message)]
-        pub fn fund_account(
-            &mut self,
-            recipient: AccountId,
-            token_type: TokenType,
-        ) -> Result<(), Error> {
-            let caller = self.env().caller();
-
-            // Only owner can call this function
-            if caller != self.owner {
-                return Err(Error::NotAuthorized);
+        pub fn record_lld_funding(&mut self, receiver: AccountId) -> Result<(), Error> {
+            // Check if caller is owner
+            if self.env().caller() != self.owner {
+                return Err(Error::OnlyOwner);
             }
 
+            // Update the last funding timestamp
             let current_time = self.env().block_timestamp();
+            self.lld_fundings.insert(receiver, &current_time);
 
-            // Check if recipient account is in cooldown period
-            if let Some(last_request) = match token_type {
-                TokenType::LLD => self.lld_fundings.get(recipient),
-                TokenType::LLM => self.llm_fundings.get(recipient),
-            } {
-                let expiry_time = last_request
-                    .checked_add(match token_type {
-                        TokenType::LLD => self.lld_cooldown_period,
-                        TokenType::LLM => self.llm_cooldown_period,
-                    })
-                    .ok_or(Error::ArithmeticError)?;
-
-                if current_time < expiry_time {
-                    return Err(Error::CooldownNotExpired);
-                }
-            }
-
-            // Update last request timestamp for recipient
-            match token_type {
-                TokenType::LLD => {
-                    self.lld_fundings.insert(recipient, &current_time);
-                }
-                TokenType::LLM => {
-                    self.llm_fundings.insert(recipient, &current_time);
-                }
-            }
-
-            // Transfer funds to recipient
-            let amount = match token_type {
-                TokenType::LLD => {
-                    // Native currency transfer
-                    if self.env().transfer(recipient, self.lld_funding_amount).is_err() {
-                        return Err(Error::TransferFailed);
-                    }
-                    self.lld_funding_amount
-                }
-                TokenType::LLM => {
-                    // Token contract call
-                    if let Some(token_contract_address) = self.llm_token_contract {
-                        let mut token_contract: ink::contract_ref!(PSP22) = 
-                            token_contract_address.into();
-                        
-                        if token_contract.transfer(recipient, self.llm_funding_amount).is_err() {
-                            return Err(Error::TokenContractError);
-                        }
-                    } else {
-                        return Err(Error::TokenContractError);
-                    }
-                    self.llm_funding_amount
-                }
-            };
-
-            self.env().emit_event(RequestFundsEvent {
-                recipient,
-                amount,
-                token_type,
+            // Emit event
+            self.env().emit_event(LLDFundingRecorded {
+                receiver,
+                amount: self.lld_amount,
+                timestamp: current_time,
             });
 
             Ok(())
         }
 
-        /// Check when a wallet can request funds again
+        /// Record LLM funding for an account (called by backend after sending tokens)
+        /// Can only be called by the owner
         #[ink(message)]
-        pub fn time_until_next_request(
-            &self,
-            account: AccountId,
+        pub fn record_llm_funding(&mut self, receiver: AccountId) -> Result<(), Error> {
+            // Check if caller is owner
+            if self.env().caller() != self.owner {
+                return Err(Error::OnlyOwner);
+            }
+
+            // Update the last funding timestamp
+            let current_time = self.env().block_timestamp();
+            self.llm_fundings.insert(receiver, &current_time);
+
+            // Emit event
+            self.env().emit_event(LLMFundingRecorded {
+                receiver,
+                amount: self.llm_amount,
+                timestamp: current_time,
+            });
+
+            Ok(())
+        }
+
+        /// Record funding for an account with specified token type
+        /// Combined function for convenience
+        #[ink(message)]
+        pub fn record_funding(
+            &mut self,
+            receiver: AccountId,
             token_type: TokenType,
-        ) -> Result<Option<u64>, Error> {
+        ) -> Result<(), Error> {
+            match token_type {
+                TokenType::LLD => self.record_lld_funding(receiver),
+                TokenType::LLM => self.record_llm_funding(receiver),
+            }
+        }
+
+        /// Check if an account is eligible for funding
+        fn check_funding_eligibility(
+            &self,
+            receiver: &AccountId,
+            token_type: TokenType,
+        ) -> Result<(), Error> {
             let current_time = self.env().block_timestamp();
 
-            if let Some(last_request) = match token_type {
-                TokenType::LLD => self.lld_fundings.get(account),
-                TokenType::LLM => self.llm_fundings.get(account),
-            } {
-                let next_valid_request = last_request
-                    .checked_add(match token_type {
-                        TokenType::LLD => self.lld_cooldown_period,
-                        TokenType::LLM => self.llm_cooldown_period,
-                    })
-                    .ok_or(Error::ArithmeticError)?;
+            let last_funding = match token_type {
+                TokenType::LLD => self.lld_fundings.get(receiver),
+                TokenType::LLM => self.llm_fundings.get(receiver),
+            };
 
-                if current_time < next_valid_request {
-                    return Ok(Some(
-                        next_valid_request
-                            .checked_sub(current_time)
-                            .ok_or(Error::ArithmeticError)?,
-                    ));
+            if let Some(last_funding) = last_funding {
+                let next_funding_time = last_funding.saturating_add(self.funding_period);
+                if current_time < next_funding_time {
+                    return Err(Error::TooEarlyForFunding);
                 }
-            }
-
-            Ok(None) // Can request now
-        }
-
-        /// Allows owner to change the funding amount
-        #[ink(message)]
-        pub fn set_funding_amount(&mut self, new_amount: Balance, token_type: TokenType) {
-            assert!(
-                self.env().caller() == self.owner,
-                "Only owner can change parameters"
-            );
-            match token_type {
-                TokenType::LLD => {
-                    self.lld_funding_amount = new_amount;
-                }
-                TokenType::LLM => {
-                    self.llm_funding_amount = new_amount;
-                }
-            }
-        }
-
-        /// Allows owner to change the cooldown period
-        #[ink(message)]
-        pub fn set_cooldown_period(&mut self, new_period: u64, token_type: TokenType) {
-            assert!(
-                self.env().caller() == self.owner,
-                "Only owner can change parameters"
-            );
-            match token_type {
-                TokenType::LLD => {
-                    self.lld_cooldown_period = new_period;
-                }
-                TokenType::LLM => {
-                    self.llm_cooldown_period = new_period;
-                }
-            }
-        }
-
-        /// Allows owner to withdraw LLD from the contract
-        #[ink(message)]
-        pub fn withdraw_lld(&mut self, amount: Balance) -> Result<(), Error> {
-            assert!(self.env().caller() == self.owner, "Only owner can withdraw");
-
-            if self.env().transfer(self.owner, amount).is_err() {
-                return Err(Error::TransferFailed);
             }
 
             Ok(())
         }
 
-        /// Check LLM token balance of the faucet contract
+        /// Get the last funding timestamp for an account and token type
         #[ink(message)]
-        pub fn get_llm_balance(&self) -> Result<Balance, Error> {
-            if let Some(token_contract_address) = self.llm_token_contract {
-                let token_contract: ink::contract_ref!(PSP22) = 
-                    token_contract_address.into();
-                Ok(token_contract.balance_of(self.env().account_id()))
-            } else {
-                Err(Error::TokenContractError)
+        pub fn get_last_funding(
+            &self,
+            account: AccountId,
+            token_type: TokenType,
+        ) -> Option<Timestamp> {
+            match token_type {
+                TokenType::LLD => self.lld_fundings.get(account),
+                TokenType::LLM => self.llm_fundings.get(account),
             }
         }
 
-        /// Get contract's native balance
+        /// Get the time remaining until next funding is available for an account and token type
         #[ink(message)]
-        pub fn get_native_balance(&self) -> Balance {
-            self.env().balance()
+        pub fn get_time_until_next_funding(
+            &self,
+            account: AccountId,
+            token_type: TokenType,
+        ) -> u64 {
+            let current_time = self.env().block_timestamp();
+
+            let last_funding = match token_type {
+                TokenType::LLD => self.lld_fundings.get(account),
+                TokenType::LLM => self.llm_fundings.get(account),
+            };
+
+            if let Some(last_funding) = last_funding {
+                let next_funding_time = last_funding.saturating_add(self.funding_period);
+                if current_time < next_funding_time {
+                    return next_funding_time.saturating_sub(current_time);
+                }
+            }
+
+            0 // Can fund immediately
+        }
+
+        /// Check if an account can be funded right now for a specific token type
+        #[ink(message)]
+        pub fn can_fund_now(&self, account: AccountId, token_type: TokenType) -> bool {
+            self.check_funding_eligibility(&account, token_type).is_ok()
+        }
+
+        /// Get the current owner
+        #[ink(message)]
+        pub fn get_owner(&self) -> AccountId {
+            self.owner
+        }
+
+        /// Get the LLD funding amount
+        #[ink(message)]
+        pub fn get_lld_amount(&self) -> Balance {
+            self.lld_amount
+        }
+
+        /// Get the LLM funding amount
+        #[ink(message)]
+        pub fn get_llm_amount(&self) -> Balance {
+            self.llm_amount
+        }
+
+        /// Get the funding period (in milliseconds)
+        #[ink(message)]
+        pub fn get_funding_period(&self) -> u64 {
+            self.funding_period
+        }
+
+        /// Change the owner (only current owner can call this)
+        #[ink(message)]
+        pub fn change_owner(&mut self, new_owner: AccountId) -> Result<(), Error> {
+            if self.env().caller() != self.owner {
+                return Err(Error::OnlyOwner);
+            }
+
+            let old_owner = self.owner;
+            self.owner = new_owner;
+
+            self.env().emit_event(OwnerChanged {
+                old_owner,
+                new_owner,
+            });
+
+            Ok(())
+        }
+
+        /// Update the LLD funding amount (only owner can call this)
+        #[ink(message)]
+        pub fn set_lld_amount(&mut self, amount: Balance) -> Result<(), Error> {
+            if self.env().caller() != self.owner {
+                return Err(Error::OnlyOwner);
+            }
+
+            if amount == 0 {
+                return Err(Error::InvalidAmount);
+            }
+
+            self.lld_amount = amount;
+            Ok(())
+        }
+
+        /// Update the LLM funding amount (only owner can call this)
+        #[ink(message)]
+        pub fn set_llm_amount(&mut self, amount: Balance) -> Result<(), Error> {
+            if self.env().caller() != self.owner {
+                return Err(Error::OnlyOwner);
+            }
+
+            if amount == 0 {
+                return Err(Error::InvalidAmount);
+            }
+
+            self.llm_amount = amount;
+            Ok(())
+        }
+
+        /// Update the funding period (only owner can call this)
+        #[ink(message)]
+        pub fn set_funding_period(&mut self, period_ms: u64) -> Result<(), Error> {
+            if self.env().caller() != self.owner {
+                return Err(Error::OnlyOwner);
+            }
+
+            if period_ms == 0 {
+                return Err(Error::InvalidAmount);
+            }
+
+            self.funding_period = period_ms;
+            Ok(())
         }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
-        use ink::env::{test, DefaultEnvironment};
 
-        // Helper function to advance block timestamp by specified milliseconds
-        fn advance_timestamp(duration_ms: u64) {
-            let current_timestamp = test::block_timestamp::<DefaultEnvironment>();
-            test::set_block_timestamp::<DefaultEnvironment>(current_timestamp + duration_ms);
+        #[ink::test]
+        fn constructor_works() {
+            let faucet = Faucet::new();
+            assert_eq!(faucet.get_lld_amount(), 1_000_000_000_000_000); // 1000 LLD
+            assert_eq!(faucet.get_llm_amount(), 10_000_000_000_000); // 10 LLM
+            assert_eq!(faucet.get_funding_period(), 24 * 60 * 60 * 1000); // 24 hours
         }
 
         #[ink::test]
-        fn default_works() {
-            let faucet = TestnetFaucet::default();
-            assert_eq!(faucet.lld_funding_amount, 1000 * 1_000_000_000_000);
-            assert_eq!(faucet.lld_cooldown_period, 86_400_000);
-            assert_eq!(faucet.llm_funding_amount, 1000 * 1_000_000_000_000);
-            assert_eq!(faucet.llm_cooldown_period, 86_400_000);
-            assert_eq!(faucet.llm_token_contract, None);
+        fn owner_can_record_funding() {
+            let mut faucet = Faucet::new();
+            let receiver = AccountId::from([0x1; 32]);
+
+            // Owner should be able to check eligibility
+            assert!(faucet.can_fund_now(receiver, TokenType::LLD));
+
+            // Owner should be able to record funding
+            let result = faucet.record_lld_funding(receiver);
+            assert!(result.is_ok());
+
+            // Verify that the funding timestamp was recorded
+            assert!(faucet.get_last_funding(receiver, TokenType::LLD).is_some());
+
+            // Verify cooldown is now active
+            assert!(!faucet.can_fund_now(receiver, TokenType::LLD));
         }
 
         #[ink::test]
-        fn fund_account_lld_works() {
-            // Create a new faucet with 10 token funding
-            let mut faucet = TestnetFaucet::new(10, 1000, 10, 1000, None);
+        fn funding_cooldown_works() {
+            let faucet = Faucet::new();
+            let receiver = AccountId::from([0x1; 32]);
 
-            // Set contract balance and accounts
-            let accounts = test::default_accounts::<DefaultEnvironment>();
-            test::set_account_balance::<DefaultEnvironment>(accounts.alice, 100);
-
-            // Set the caller to be the owner (contract creator)
-            test::set_caller::<DefaultEnvironment>(accounts.alice);
-
-            // Test account to fund
-            let recipient = accounts.bob;
-
-            // Request LLD funds should succeed
-            assert!(faucet.fund_account(recipient, TokenType::LLD).is_ok());
-
-            // Second request for same recipient should fail due to cooldown
+            // Initially should be able to fund both tokens
+            assert!(faucet.can_fund_now(receiver, TokenType::LLD));
+            assert!(faucet.can_fund_now(receiver, TokenType::LLM));
             assert_eq!(
-                faucet.fund_account(recipient, TokenType::LLD),
-                Err(Error::CooldownNotExpired)
+                faucet.get_time_until_next_funding(receiver, TokenType::LLD),
+                0
             );
-
-            // Advance time
-            advance_timestamp(1001);
-
-            // Now the request should succeed
-            assert!(faucet.fund_account(recipient, TokenType::LLD).is_ok());
-
-            // Test authorization
-            test::set_caller::<DefaultEnvironment>(accounts.bob);
             assert_eq!(
-                faucet.fund_account(accounts.charlie, TokenType::LLD),
-                Err(Error::NotAuthorized)
+                faucet.get_time_until_next_funding(receiver, TokenType::LLM),
+                0
             );
         }
 
         #[ink::test]
-        fn fund_account_llm_without_contract_fails() {
-            let mut faucet = TestnetFaucet::default();
-            let accounts = test::default_accounts::<DefaultEnvironment>();
-            test::set_caller::<DefaultEnvironment>(accounts.alice);
+        fn only_owner_can_change_settings() {
+            let mut faucet = Faucet::new();
+            let new_lld_amount = 2_000_000_000_000_000; // 2000 LLD
+            let new_llm_amount = 20_000_000_000_000; // 20 LLM
 
-            // Should fail because no LLM token contract is set
-            assert_eq!(
-                faucet.fund_account(accounts.bob, TokenType::LLM),
-                Err(Error::TokenContractError)
-            );
+            // Owner should be able to change amounts
+            assert!(faucet.set_lld_amount(new_lld_amount).is_ok());
+            assert_eq!(faucet.get_lld_amount(), new_lld_amount);
+
+            assert!(faucet.set_llm_amount(new_llm_amount).is_ok());
+            assert_eq!(faucet.get_llm_amount(), new_llm_amount);
         }
 
         #[ink::test]
-        fn set_llm_token_contract_works() {
-            let mut faucet = TestnetFaucet::default();
-            let accounts = test::default_accounts::<DefaultEnvironment>();
-            test::set_caller::<DefaultEnvironment>(accounts.alice);
+        fn non_owner_cannot_record_funding() {
+            let mut faucet = Faucet::new();
+            let receiver = AccountId::from([0x1; 32]);
 
-            // Set LLM token contract
-            faucet.set_llm_token_contract(accounts.charlie);
-            assert_eq!(faucet.llm_token_contract, Some(accounts.charlie));
+            // Change to a different account (simulate non-owner calling)
+            ink::env::test::set_caller::<ink::env::DefaultEnvironment>(AccountId::from([0x2; 32]));
+
+            let result_lld = faucet.record_lld_funding(receiver);
+            assert_eq!(result_lld, Err(Error::OnlyOwner));
+
+            let result_llm = faucet.record_llm_funding(receiver);
+            assert_eq!(result_llm, Err(Error::OnlyOwner));
         }
 
         #[ink::test]
-        fn time_until_next_request_works() {
-            // Create a new faucet
-            let mut faucet = TestnetFaucet::new(10, 1000, 10, 1000, None);
+        fn combined_record_funding_works() {
+            let mut faucet = Faucet::new();
+            let receiver = AccountId::from([0x1; 32]);
 
-            // Get accounts
-            let accounts = test::default_accounts::<DefaultEnvironment>();
-            test::set_caller::<DefaultEnvironment>(accounts.alice);
+            // Test combined function for LLD
+            assert!(faucet.can_fund_now(receiver, TokenType::LLD));
+            let result = faucet.record_funding(receiver, TokenType::LLD);
+            assert!(result.is_ok());
+            assert!(!faucet.can_fund_now(receiver, TokenType::LLD));
 
-            // Initially should return None (can request)
-            assert_eq!(
-                faucet
-                    .time_until_next_request(accounts.bob, TokenType::LLD)
-                    .unwrap(),
-                None
-            );
-
-            // Fund the account
-            assert!(faucet.fund_account(accounts.bob, TokenType::LLD).is_ok());
-
-            // Now should return Some time
-            assert!(faucet
-                .time_until_next_request(accounts.bob, TokenType::LLD)
-                .unwrap()
-                .is_some());
-
-            // Advance time partially
-            advance_timestamp(500);
-
-            // Should still return Some time, but less
-            let time_left = faucet
-                .time_until_next_request(accounts.bob, TokenType::LLD)
-                .unwrap()
-                .unwrap();
-            assert!(time_left > 0 && time_left <= 500);
-
-            // Advance time fully
-            advance_timestamp(1000);
-
-            // Should return None again
-            assert_eq!(
-                faucet
-                    .time_until_next_request(accounts.bob, TokenType::LLD)
-                    .unwrap(),
-                None
-            );
+            // Test combined function for LLM
+            assert!(faucet.can_fund_now(receiver, TokenType::LLM));
+            let result = faucet.record_funding(receiver, TokenType::LLM);
+            assert!(result.is_ok());
+            assert!(!faucet.can_fund_now(receiver, TokenType::LLM));
         }
     }
 }

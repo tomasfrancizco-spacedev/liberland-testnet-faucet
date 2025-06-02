@@ -9,6 +9,8 @@ ink = { version = "5.1.1", default-features = false }
 scale = { package = "parity-scale-codec", version = "3.6.4", default-features = false, features = ["derive"] }
 scale-info = { version = "2.10.0", default-features = false, features = ["derive"] }
 
+liberland-extension = { git = "https://github.com/liberland/liberland_substrate", package = "liberland-extension", default-features = false }
+
 [dev-dependencies]
 ink_e2e = { version = "5.1.1" }
 
@@ -21,6 +23,7 @@ std = [
     "ink/std",
     "scale/std",
     "scale-info/std",
+    "liberland-extension/std",
 ]
 ink-as-dependency = []
 e2e-tests = []
